@@ -4,76 +4,64 @@ import httpx
 import time
 from collections import deque
 from threading import Lock
+import heapq
+import asyncio
 
 CLASSIFICATION_SERVER_URL = "http://localhost:8001/classify"
 
 app = FastAPI(
     title="Classification Proxy",
-    description="Proxy server that handles rate limiting and retries for the code classification service"
+    description="Proxy server that handles batching and scheduling for the code classification service"
 )
 
 class ProxyRequest(BaseModel):
-    """Request model for single text classification"""
     sequence: str
 
 class ProxyResponse(BaseModel):
-    """Response model containing classification result ('code' or 'not code')"""
     result: str
 
+queue_lock = Lock()
+short_request_queue = deque()
+long_request_heap = []
+batch_ready_sem = asyncio.Event() 
+WAIT_CUTOFF = 12
 
-request_queue = deque()
-response_dict = {}
-proxy_lock = Lock()
+async def batch_processor():
+    while True:
+        await batch_ready_sem.wait()
+        with queue_lock:
+            batch_ready_sem.clear()
+            batch = []
+            # simply empty out the 'smaller' queued-up requests before the larger one
+            while short_request_queue and len(batch) < 5:
+                seq = short_request_queue.popleft()
+                batch.append(seq)
+            while long_request_heap and len(batch) < 5:
+                _, seq = heapq.heappop(long_request_heap)
+                batch.append(seq)
+        if batch:
+            print(f"[INFO] Sending batch: {batch}")
+            async with httpx.AsyncClient() as client:
+                response = await client.post(CLASSIFICATION_SERVER_URL, json={"sequences": batch})
+                if response.status_code == 200:
+                    results = response.json()["results"]
+                    print(f"[INFO] Batch processed, results: {results}")
+                else:
+                    print(f"[ERROR] Failed to process batch, status: {response.status_code}")
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(batch_processor())
 
 @app.post("/proxy_classify")
-def proxy_classify(req: ProxyRequest):
-    """
-    Proxies a single text sequence to the classification server.
-    Handles rate limiting by implementing a retry mechanism when the server is busy.
-
-    TODO: Implement your own batching and queueing logic here
-    """
-    global request_queue, response_dict
-    
-    # Add new request to queue
-    request_queue.append(req.sequence)
-    
-    # Try to acquire lock for processing
-    lock_acquired = proxy_lock.acquire(blocking=False)
-    if not lock_acquired:
-        # If we can't get the lock, wait for our request to be processed
-        while req.sequence in request_queue:
-            time.sleep(0.1)
-        # Get our result from the response dict
-        if req.sequence in response_dict:
-            result = response_dict.pop(req.sequence)
-            return ProxyResponse(result=result)
-
-    
-    try:
-        with httpx.Client() as client:
-            while request_queue:
-                sequence = request_queue[0]
-                while True:  # Keep trying until we get a successful response
-                    try:
-                        classification_request = {"sequences": [sequence]}
-                        response = client.post(CLASSIFICATION_SERVER_URL, json=classification_request)
-                        
-                        if response.status_code == 200:
-                            data = response.json()
-                            request_queue.popleft()  # Remove processed request
-                            result = data["results"][0]
-                            if sequence == req.sequence:
-                                return ProxyResponse(result=result)
-                            else:
-                                response_dict[sequence] = result
-                            break  # Got a successful response, move to next request
-                        elif response.status_code == 429:
-                            time.sleep(0.1)  # Wait before retry
-                        else:
-                            response.raise_for_status()
-                    except Exception:
-                        time.sleep(0.1)  # Wait before retry on any error
-    finally:
-        if lock_acquired:
-            proxy_lock.release()
+async def proxy_classify(req: ProxyRequest):
+    sequence = req.sequence
+    with queue_lock:
+        if len(sequence) <= WAIT_CUTOFF: 
+            short_request_queue.append(sequence)
+        else: # proabbly minimal benefit in trying to wait for smaller requets
+            heapq.heappush(long_request_heap, (len(sequence), sequence))
+        if len(short_request_queue) + len(long_request_heap) >= 5 or len(sequence) > 12:
+            batch_ready_sem.set()
+    print(f"[INFO] Request queued: {sequence}")
+    return {"message": "Request received."}
