@@ -61,7 +61,7 @@ async def proxy_classify(req: ProxyRequest):
             short_request_queue.append(sequence)
         else: # proabbly minimal benefit in trying to wait for smaller requets
             heapq.heappush(long_request_heap, (len(sequence), sequence))
-        if len(short_request_queue) + len(long_request_heap) >= 5 or len(sequence) > 12:
+        if len(short_request_queue) + len(long_request_heap) >= 5 or len(sequence) > WAIT_CUTOFF:
             batch_ready_sem.set()
     print(f"[INFO] Request queued: {sequence}")
     return {"message": "Request received."}
